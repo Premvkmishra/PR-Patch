@@ -1,3 +1,5 @@
+![PRpatch self-healing run logs](assets/Screenshot%202026-10-17%20175445.png)
+
 # PRpatch
 
 **An AI-powered CI repair agent that analyzes failed GitHub Actions runs and proposes focused fixes through pull requests.**
