@@ -3,6 +3,7 @@ import httpx
 import base64
 import logging
 from typing import AsyncGenerator
+from urllib.parse import quote
 from dotenv import load_dotenv
 from google.adk.agents import Agent
 from google.adk.models.base_llm import BaseLlm
@@ -108,7 +109,7 @@ def fetch_run_jobs(repo: str, run_id: str) -> str:
         return "\n\n".join(job_logs) or f"No logs available for run {run_id}."
 
 # Tool 2: get_file_contents
-def get_file_contents(repo: str, path: str) -> str:
+def get_file_contents(repo: str, path: str, ref: str = "main") -> str:
     """
     Fetches the actual source code of a file from the repository.
     Returns the decoded file content as a string.
@@ -119,9 +120,9 @@ def get_file_contents(repo: str, path: str) -> str:
     headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
     if token: headers["Authorization"] = f"Bearer {token}"
 
-    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    url = f"https://api.github.com/repos/{repo}/contents/{quote(path, safe='/')}"
     with httpx.Client() as client:
-        response = client.get(url, headers=headers)
+        response = client.get(url, headers=headers, params={"ref": ref})
         if response.status_code == 200:
             data = response.json()
             if "content" in data:
@@ -178,7 +179,7 @@ def update_file(repo: str, path: str, content: str, branch: str, sha: str) -> st
         return f"Error committing file: HTTP {response.status_code} - {response.text}"
 
 # Tool 5: get_file_sha
-def get_file_sha(repo: str, path: str) -> str:
+def get_file_sha(repo: str, path: str, ref: str = "main") -> str:
     """
     Gets the blob SHA for a specific file in the repository. This is required before calling update_file.
     """
@@ -188,9 +189,9 @@ def get_file_sha(repo: str, path: str) -> str:
     headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
     if token: headers["Authorization"] = f"Bearer {token}"
 
-    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    url = f"https://api.github.com/repos/{repo}/contents/{quote(path, safe='/')}"
     with httpx.Client() as client:
-        response = client.get(url, headers=headers)
+        response = client.get(url, headers=headers, params={"ref": ref})
         if response.status_code == 200:
             return response.json().get("sha", "")
         return ""
@@ -251,17 +252,17 @@ cicd_agent = Agent(
     You are an autonomous CI/CD self-healing agent.
     When a pipeline fails, you are given the repository name and run ID (and optionally the base_sha).
     You must automatically execute the following workflow:
-    1. Call list_repository_files(repo) to fetch the entire repository file structure.
+    1. Call list_repository_files(repo, base_sha) to fetch the file structure at the failing commit.
     2. Call fetch_run_jobs(repo, run_id) to read the failure logs.
     3. Analyze the logs to identify the failing test/file and cross-reference it with the repository structure to get the exact file path.
-    4. Call get_file_contents(repo, failing_file_path) to get the broken source code.
-    5. If the broken code imports or depends on other files (e.g. utility functions, helper components, or configurations) that are relevant to understanding/fixing the bug, call get_file_contents(repo, dependency_path) for those files as well.
+    4. Call get_file_contents(repo, failing_file_path, base_sha) to get the broken source code at the failing commit.
+    5. If the broken code imports or depends on other files (e.g. utility functions, helper components, or configurations) that are relevant to understanding/fixing the bug, call get_file_contents(repo, dependency_path, base_sha) for those files as well.
     6. Generate a logical fix for the source code.
     7. Generate a new, descriptive branch name.
     8. Call create_branch(repo, base_sha, branch_name) to create a new branch.
-    9. Call get_file_sha(repo, failing_file_path) to get the file's blob SHA.
+    9. Call get_file_sha(repo, failing_file_path, base_sha) to get the file's blob SHA at the failing commit.
     10. Call update_file(repo, failing_file_path, fixed_content, branch_name, file_sha) to commit the fix.
-    11. Call create_pull_request(repo, branch_name, "main", "AI Auto-Fix: Resolved CI/CD Pipeline Failure", pr_body) to create a Pull Request. Specify in pr_body the details of the problem, the fix, and any modified files.
+    11. Call create_pull_request(repo, branch_name, target_branch, "AI Auto-Fix: Resolved CI/CD Pipeline Failure", pr_body) to create a Pull Request against the requested target_branch. For failed pull-request checks, target_branch is the PR's source branch so the focused repair can be merged into that PR.
 
     Work step by step and confirm when the Pull Request is successfully created.
     """,

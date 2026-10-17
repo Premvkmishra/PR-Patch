@@ -16,7 +16,7 @@ PRpatch automates part of that loop for GitHub Actions:
 
 1. A failed workflow triggers a notification workflow in the target repository.
 2. The notification sends the repository, workflow run ID, commit SHA, and branch to PRpatch.
-3. PRpatch authenticates the request and returns `202 Accepted` immediately; repair work runs in a background task.
+3. PRpatch authenticates the request and acknowledges it immediately; repair work runs in a background task.
 4. It fetches failed-job logs and trims them to a relevant, model-friendly excerpt.
 5. A Google ADK agent examines the log and, when needed, reads relevant repository files at the failing commit.
 6. The agent may submit one proposed file replacement. It cannot directly commit or open pull requests.
@@ -185,7 +185,7 @@ Use the same secret value for `WEBHOOK_SECRET` on the PRpatch server and the `PR
 pytest -q
 ```
 
-The supplied mocked test suite is expected to report **6 passed**. These tests exercise the local logic with mocks; they do not prove that a live Gemini API key or a live GitHub repository integration is configured correctly.
+The supplied mocked test suite is expected to report **7 passed**. These tests exercise the local logic with mocks; they do not prove that a live Gemini API key or a live GitHub repository integration is configured correctly.
 
 ### 5. Start the server
 
@@ -215,7 +215,7 @@ For local experimentation, start a tunnel in another terminal:
 ngrok http 8000
 ```
 
-Set `PRPATCH_URL` in the target repository to the public HTTPS URL provided by the tunnel, without a trailing slash.
+Set `WEBHOOK_URL` in the target repository to the full `/webhook` URL provided by the tunnel.
 
 For production, deploy to a long-lived service that can keep background work running. This MVP is not designed for Vercel serverless functions.
 
@@ -240,14 +240,14 @@ The token is used by the server for reading workflow/job information and reposit
 
 In the target repository, open **Settings → Secrets and variables → Actions** and add:
 
-- `PRPATCH_URL` — the public base URL of the running PRpatch server.
-- `PRPATCH_WEBHOOK_SECRET` — the same value configured as `WEBHOOK_SECRET` on the server.
+- `WEBHOOK_URL` — the full public webhook URL, for example `https://your-service.onrender.com/webhook`.
+- `WEBHOOK_SECRET` — the same value configured as `WEBHOOK_SECRET` on the server.
 
 ### 2. Add the notification workflow
 
 Copy `examples/notify-prpatch.yml` into the target repository's `.github/workflows/` directory. For example, save it as `.github/workflows/notify-prpatch.yml`.
 
-The example listens for completed workflows named `CI` and notifies PRpatch only when the run failed and belongs to the same repository. Change the `workflows: ["CI"]` value to match the exact `name:` of the workflow you want to monitor.
+The example listens for completed workflows named `CI` and notifies PRpatch when a push or same-repository pull request fails. For pull-request failures, it uses the PR's head commit and opens the repair PR against the original PR's source branch. Fork pull requests are skipped. Change the `workflows: ["CI"]` value to match the exact `name:` of the workflow you want to monitor.
 
 The notification workflow must be present on the target repository's **default branch** for `workflow_run` events to work as expected.
 

@@ -1,13 +1,18 @@
 import os
 import unittest
-from unittest.mock import AsyncMock
-from unittest.mock import patch
+import base64
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 
-from agent import GeminiWithGroqFallback, fetch_run_jobs
+from agent import (
+    GeminiWithGroqFallback,
+    fetch_run_jobs,
+    get_file_contents,
+    get_file_sha,
+)
 import main
 
 
@@ -61,6 +66,22 @@ class StubHttpClient:
     def get(self, url, headers):
         self.request_headers.append(headers)
         return self.responses.pop(0)
+
+
+class RecordingContentClient:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def get(self, url, headers, params=None):
+        self.calls.append((url, params))
+        return self.response
 
 
 class GeminiWithGroqFallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -123,6 +144,30 @@ class FetchRunJobsTests(unittest.TestCase):
         self.assertIn("AssertionError: expected 1, got 2", logs)
 
 
+class RepositoryRefTests(unittest.TestCase):
+    def test_get_file_contents_reads_requested_commit(self):
+        client = RecordingContentClient(
+            StubResponse(
+                200,
+                "",
+                {"content": base64.b64encode(b"source at commit").decode()},
+            )
+        )
+        with patch("agent.httpx.Client", return_value=client):
+            content = get_file_contents("owner/repo", "src/file.py", "commit-sha")
+
+        self.assertEqual(content, "source at commit")
+        self.assertEqual(client.calls[0][1], {"ref": "commit-sha"})
+
+    def test_get_file_sha_reads_requested_commit(self):
+        client = RecordingContentClient(StubResponse(200, "", {"sha": "blob-sha"}))
+        with patch("agent.httpx.Client", return_value=client):
+            sha = get_file_sha("owner/repo", "src/file.py", "commit-sha")
+
+        self.assertEqual(sha, "blob-sha")
+        self.assertEqual(client.calls[0][1], {"ref": "commit-sha"})
+
+
 class WebhookAuthTests(unittest.TestCase):
     def test_health_endpoint(self):
         response = TestClient(main.app).get("/health")
@@ -132,13 +177,20 @@ class WebhookAuthTests(unittest.TestCase):
 
     def test_requires_configured_bearer_secret(self):
         client = TestClient(main.app)
-        payload = {"repo": "owner/repo", "run_id": "123"}
+        payload = {
+            "repo": "owner/repo",
+            "run_id": "123",
+            "branch": "feature/source",
+            "head_sha": "commit-sha",
+            "target_branch": "feature/source",
+        }
+        process_failure = AsyncMock()
 
         with (
             patch.object(main, "WEBHOOK_SECRET", "test-secret"),
             patch(
                 "main.fetch_and_log_github_failure",
-                new_callable=AsyncMock,
+                new=process_failure,
             ),
         ):
             unauthorized = client.post(
@@ -154,3 +206,29 @@ class WebhookAuthTests(unittest.TestCase):
 
         self.assertEqual(unauthorized.status_code, 401)
         self.assertEqual(accepted.status_code, 200)
+        process_failure.assert_awaited_once_with(
+            "owner/repo",
+            "123",
+            "commit-sha",
+            None,
+            "feature/source",
+        )
+
+
+class RepairPromptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_repair_prompt_uses_requested_target_branch(self):
+        runner = MagicMock()
+        runner.run_debug = AsyncMock(return_value=[])
+
+        with patch("google.adk.runners.InMemoryRunner", return_value=runner):
+            await main.fetch_and_log_github_failure(
+                "owner/repo",
+                "123",
+                "commit-sha",
+                "test log",
+                "feature/source",
+            )
+
+        prompt = runner.run_debug.await_args.args[0]
+        self.assertIn("Create the repair pull request against branch feature/source", prompt)
+        self.assertIn("Use this exact SHA as the ref", prompt)

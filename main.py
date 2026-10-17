@@ -27,9 +27,16 @@ class WebhookPayload(BaseModel):
     run_id: str      # e.g., "123456789"
     branch: Optional[str] = None
     head_sha: Optional[str] = None
+    target_branch: Optional[str] = None
     logs: Optional[str] = None
 
-async def fetch_and_log_github_failure(repository: str, run_id: str, head_sha: str = None, provided_logs: str = None):
+async def fetch_and_log_github_failure(
+    repository: str,
+    run_id: str,
+    head_sha: str = None,
+    provided_logs: str = None,
+    target_branch: str = "main",
+):
     try:
         if provided_logs:
             logger.info("Using logs provided in webhook payload.")
@@ -106,7 +113,13 @@ async def fetch_and_log_github_failure(repository: str, run_id: str, head_sha: s
 
         if head_sha:
             logger.info("Triggering Google ADK Autonomous Agent for self-healing...")
-            prompt = f"The pipeline failed for repo {repository} on run {run_id}. The base commit SHA for branching is {head_sha}. Please automatically execute your self-healing workflow to fix the bug."
+            prompt = (
+                f"The pipeline failed for repo {repository} on run {run_id}. "
+                f"The failing commit SHA is {head_sha}. Use this exact SHA as the "
+                f"ref when reading files and as the base for the repair branch. "
+                f"Create the repair pull request against branch {target_branch}. "
+                "Please automatically execute your self-healing workflow to fix the bug."
+            )
             try:
                 from google.adk.runners import InMemoryRunner
                 runner = InMemoryRunner(agent=cicd_agent)
@@ -126,7 +139,15 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 async def receive_webhook(
     request: Request, payload: WebhookPayload, background_tasks: BackgroundTasks
 ):
-    logger.info(f"🚀 WEBHOOK TRIGGERED! Pipeline failed for repository: {payload.repo}, Run ID: {payload.run_id}, Branch: {payload.branch}")
+    target_branch = payload.target_branch or payload.branch or "main"
+    logger.info(
+        "🚀 WEBHOOK TRIGGERED! Pipeline failed for repository: %s, Run ID: %s, "
+        "Branch: %s, repair PR target: %s",
+        payload.repo,
+        payload.run_id,
+        payload.branch,
+        target_branch,
+    )
 
     auth = request.headers.get("Authorization")
 
@@ -146,7 +167,8 @@ async def receive_webhook(
         payload.repo,
         payload.run_id,
         payload.head_sha,
-        payload.logs
+        payload.logs,
+        target_branch,
     )
 
     return {
