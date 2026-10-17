@@ -96,36 +96,55 @@ The agent does **not** receive tools that directly write to GitHub or create pul
 |---|---|
 | API server | Python, FastAPI, Uvicorn |
 | Agent framework | Google Agent Development Kit (ADK) |
-| Model | Gemini, configurable with `PRPATCH_MODEL` |
+| Models | Hosted Gemini API, with optional hosted Groq fallback using open-weights Llama 3.3 |
 | GitHub integration | GitHub REST API via `httpx` |
 | Configuration | `python-dotenv` |
 | Validation | Python AST parsing, JSON parsing, diff-size guard |
-| Tests | `pytest`, `pytest-asyncio`, mocked HTTP transport |
+| Tests | Python `unittest` with mocked HTTP transport |
 | Notification | GitHub Actions `workflow_run` workflow |
+
+## Built with open source
+
+Prpatch uses the following open-source packages:
+
+| Package | License | Use |
+|---|---|---|
+| [google-adk](https://github.com/google/adk-python) | Apache 2.0 | Agent orchestration and tool execution |
+| [google-genai](https://github.com/googleapis/python-genai) | Apache 2.0 | Google Gemini API client |
+| [FastAPI](https://github.com/fastapi/fastapi) | MIT | Webhook and health API |
+| [Uvicorn](https://github.com/encode/uvicorn) | BSD-3-Clause | ASGI application server |
+| [httpx](https://github.com/encode/httpx) | BSD-3-Clause | GitHub REST API requests |
+| [Pydantic](https://github.com/pydantic/pydantic) | MIT | Request and configuration validation |
+| [python-dotenv](https://github.com/theskumar/python-dotenv) | BSD-3-Clause | Local environment configuration |
+| [LiteLLM](https://github.com/BerriAI/litellm) | MIT | Optional Groq provider integration |
+| [pytest](https://github.com/pytest-dev/pytest) | MIT | Tests in the companion CI-check repository; not a backend runtime dependency |
+
+The AI models are accessed through hosted APIs: Gemini 2.5 Flash through Google, with an optional open-weights Llama 3.3 fallback through Groq. Open-weights does not mean open source. GitHub Actions and Render are hosted platforms; they are not open-source components of this stack. This project uses open-source software but does not claim that the entire service or stack is open source.
+
+The resolved backend dependency tree and package license URLs are recorded in
+[THIRD_PARTY_LICENSES.md](./THIRD_PARTY_LICENSES.md).
 
 ## Project structure
 
-The MVP uses root-level Python modules:
+The repository is organized around two root-level Python modules:
 
 ```text
 prpatch/
+├── .github/
+│   └── workflows/
+│       └── ci.yml
+├── assets/                    # README screenshots
 ├── main.py                    # FastAPI app, authentication, webhook and health endpoints
-├── pipeline.py                # Repair orchestration, retries, branch/commit/PR flow
-├── agent.py                   # ADK agent and guarded repository tools
-├── github_api.py              # Async GitHub REST API client
-├── log_utils.py               # CI log cleanup and error-context extraction
+├── agent.py                   # ADK agent and GitHub tools
 ├── requirements.txt
-├── pytest.ini
 ├── .env.example
 ├── .gitignore
 ├── tests/
-│   ├── conftest.py
-│   └── test_all.py
-└── examples/
-    └── notify-prpatch.yml     # Copy this into the target repository's workflows directory
+│   └── test_model_fallback.py
+└── render.yaml
 ```
 
-The notification workflow belongs in the **target repository**, not in the PRpatch server repository.
+The notification workflow is configured in the target repository, not in this backend repository.
 
 ## Prerequisites
 
@@ -167,6 +186,7 @@ Copy `.env.example` to `.env` and fill in the values:
 GOOGLE_API_KEY=
 GITHUB_TOKEN=
 WEBHOOK_SECRET=
+GROQ_API_KEY=
 PRPATCH_MODEL=gemini-2.5-flash
 PRPATCH_MAX_DIFF_LINES=80
 ```
@@ -179,6 +199,7 @@ API with explicit session creation, rather than the newer `run_debug` helper.
 |---|---|
 | `GOOGLE_API_KEY` | API key used by the Gemini-powered ADK agent. |
 | `GITHUB_TOKEN` | GitHub token used for repository reads and pull-request creation. |
+| `GROQ_API_KEY` | Optional API key for the Groq-hosted Llama fallback when Gemini fails before responding. |
 | `WEBHOOK_SECRET` | Secret required in the `Authorization: Bearer ...` header sent to the webhook. |
 | `PRPATCH_MODEL` | Gemini model name; defaults to `gemini-2.5-flash`. Confirm model availability for your API key. |
 | `PRPATCH_MAX_DIFF_LINES` | Maximum number of changed lines accepted in the proposed patch; defaults to `80`. |
@@ -362,4 +383,4 @@ Built for the Hacktoberfest / MLH Hack Day community.
 
 ## License
 
-Add the project's chosen open-source license before publishing. Until a license is added to the repository, do not assume the code is available for unrestricted reuse.
+This project is licensed under the [MIT License](./LICENSE).
