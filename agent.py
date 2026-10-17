@@ -29,7 +29,7 @@ def _headers() -> dict[str, str]:
 
 def _tool_result(name: str, arguments: str, success: bool, detail: str = "") -> None:
     result = "OK" if success else f"FAIL {detail}"
-    logger.info("[TOOL] %s %s result=%s", name, arguments, result)
+    logger.info("AGENT ACTION: %s %s result=%s", name, arguments, result)
 
 
 def _redact_secrets(text: str) -> str:
@@ -91,7 +91,7 @@ class GeminiWithGroqFallback(BaseLlm):
 
 
 def fetch_run_jobs(repo: str, run_id: str) -> str:
-    logger.info("[TOOL] fetch_run_jobs repo=%s run=%s start", repo, run_id)
+    logger.info("AGENT ACTION: fetch_run_jobs repo=%s run=%s start", repo, run_id)
     try:
         headers = _headers()
     except RuntimeError as error:
@@ -138,7 +138,7 @@ def fetch_run_jobs(repo: str, run_id: str) -> str:
             )
             if logs_response.status_code == 200:
                 logger.info(
-                    "[TOOL] fetch_job_logs repo=%s job=%r result=OK",
+                    "AGENT ACTION: fetch_job_logs repo=%s job=%r result=OK",
                     repo,
                     job_name,
                 )
@@ -165,7 +165,7 @@ def fetch_run_jobs(repo: str, run_id: str) -> str:
 
 def get_file_contents(repo: str, path: str, ref: str = "") -> str:
     logger.info(
-        "[TOOL] get_file_contents repo=%s path=%s ref=%s start",
+        "AGENT ACTION: get_file_contents repo=%s path=%s ref=%s start",
         repo,
         path,
         ref or "default",
@@ -210,7 +210,7 @@ def create_branch(
     repo: str, base_sha: str, new_branch_name: str, run_id: str = ""
 ) -> str:
     logger.info(
-        "[TOOL] create_branch repo=%s branch=%s base=%s start",
+        "AGENT ACTION: create_branch repo=%s branch=%s base=%s start",
         repo,
         new_branch_name,
         base_sha[:7],
@@ -243,7 +243,7 @@ def create_branch(
         response = client.post(url, headers=headers, json=payload)
         if response.status_code == 201:
             logger.info(
-                "[TOOL] Branch created: %s  (base: %s)",
+                "AGENT ACTION: Branch created: %s  (base: %s)",
                 new_branch_name,
                 base_sha[:7],
             )
@@ -260,7 +260,7 @@ def create_branch(
 
 def update_file(repo: str, path: str, content: str, branch: str, sha: str) -> str:
     logger.info(
-        "[TOOL] update_file repo=%s path=%s branch=%s start",
+        "AGENT ACTION: update_file repo=%s path=%s branch=%s start",
         repo,
         path,
         branch,
@@ -294,7 +294,7 @@ def update_file(repo: str, path: str, content: str, branch: str, sha: str) -> st
 
 def get_file_sha(repo: str, path: str, ref: str = "") -> str:
     logger.info(
-        "[TOOL] get_file_sha repo=%s path=%s ref=%s start",
+        "AGENT ACTION: get_file_sha repo=%s path=%s ref=%s start",
         repo,
         path,
         ref or "default",
@@ -336,7 +336,7 @@ def get_file_sha(repo: str, path: str, ref: str = "") -> str:
 
 def create_pull_request(repo: str, branch: str, base: str, title: str, body: str) -> str:
     logger.info(
-        "[TOOL] create_pull_request repo=%s head=%s base=%s start",
+        "AGENT ACTION: create_pull_request repo=%s head=%s base=%s start",
         repo,
         branch,
         base,
@@ -360,7 +360,7 @@ def create_pull_request(repo: str, branch: str, base: str, title: str, body: str
             pr_url = response.json().get("html_url")
             if pr_url:
                 logger.info(
-                    "[TOOL] Pull Request opened: %s  (%s -> %s)",
+                    "AGENT ACTION: Pull Request opened: %s  (%s -> %s)",
                     pr_url,
                     branch,
                     base,
@@ -380,7 +380,7 @@ def create_pull_request(repo: str, branch: str, base: str, title: str, body: str
 
 
 def list_repository_files(repo: str, branch: str = "main") -> str:
-    logger.info("[TOOL] list_repository_files repo=%s ref=%s start", repo, branch)
+    logger.info("AGENT ACTION: list_repository_files repo=%s ref=%s start", repo, branch)
     try:
         headers = _headers()
     except RuntimeError as error:

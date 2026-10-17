@@ -163,6 +163,10 @@ PRPATCH_MODEL=gemini-2.5-flash
 PRPATCH_MAX_DIFF_LINES=80
 ```
 
+Install dependencies with `pip install -r requirements.txt`; the ADK dependency
+is constrained to `google-adk>=1.18.0`. Agent execution uses ADK's `run_async`
+API with explicit session creation, rather than the newer `run_debug` helper.
+
 | Variable | Purpose |
 |---|---|
 | `GOOGLE_API_KEY` | API key used by the Gemini-powered ADK agent. |

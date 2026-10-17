@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
+from google.adk.agents import Agent
+from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 
@@ -102,6 +104,26 @@ class ActionLogsClient:
                 {"jobs": [{"id": 9, "name": "unit-tests", "conclusion": "failure"}]},
             )
         return StubResponse(200, self.log_text)
+
+
+class RunnerStub:
+    def __init__(self, session):
+        self.session = session
+        self.session_service = MagicMock()
+        self.session_service.create_session.return_value = session
+        self.run_args = None
+
+    async def run_async(self, **kwargs):
+        self.run_args = kwargs
+        yield "event-1"
+        yield "event-2"
+
+
+class StaticLlm(BaseLlm):
+    model: str = "static-test-model"
+
+    async def generate_content_async(self, llm_request, stream=False):
+        yield model_response("Runner completed without external API calls.")
 
 
 class GeminiWithGroqFallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -309,30 +331,27 @@ class FailureProcessingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reads_failing_commit_and_reports_pr_summary(self):
         log_text = "\n".join(f"output line-{index}" for index in range(110))
-        runner = MagicMock()
-        runner.run_debug = AsyncMock(
-            return_value=[
-                SimpleNamespace(
-                    content=SimpleNamespace(
-                        parts=[
-                            SimpleNamespace(
-                                text=(
-                                    "Root cause: src/utils.py::is_even. "
-                                    "Successfully created Pull Request: "
-                                    "https://github.com/owner/repo/pull/7"
-                                )
+        events = [
+            SimpleNamespace(
+                content=SimpleNamespace(
+                    parts=[
+                        SimpleNamespace(
+                            text=(
+                                "Root cause: src/utils.py::is_even. "
+                                "Successfully created Pull Request: "
+                                "https://github.com/owner/repo/pull/7"
                             )
-                        ]
-                    )
+                        )
+                    ]
                 )
-            ]
-        )
+            )
+        ]
         http_client = ActionLogsClient(log_text)
 
         with (
             patch.dict(os.environ, {"GITHUB_TOKEN": "test-token"}),
             patch("main.httpx.Client", return_value=http_client),
-            patch("google.adk.runners.InMemoryRunner", return_value=runner),
+            patch("main.run_agent", new=AsyncMock(return_value=events)) as run_agent,
             self.assertLogs("webhook_handler", level="INFO") as captured,
         ):
             await main.fetch_and_log_github_failure(
@@ -342,7 +361,7 @@ class FailureProcessingTests(unittest.IsolatedAsyncioTestCase):
                 target_branch="test1",
             )
 
-        prompt = runner.run_debug.await_args.args[0]
+        prompt = run_agent.await_args.args[1]
         self.assertIn("failing branch is test1", prompt)
         self.assertIn("at failing commit abcdef012345", prompt)
         output = "\n".join(captured.output)
@@ -350,3 +369,45 @@ class FailureProcessingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("output line-0", output)
         self.assertIn("Root cause: src/utils.py::is_even", output)
         self.assertIn("https://github.com/owner/repo/pull/7", output)
+
+    async def test_run_agent_supports_async_session_creation(self):
+        session = SimpleNamespace(id="session-id")
+        runner = RunnerStub(session)
+        runner.session_service.create_session = AsyncMock(return_value=session)
+
+        with patch("google.adk.runners.InMemoryRunner", return_value=runner) as factory:
+            events = await main.run_agent(MagicMock(), "fix the failure")
+
+        self.assertEqual(events, ["event-1", "event-2"])
+        factory.assert_called_once()
+        self.assertEqual(factory.call_args.kwargs["app_name"], "prpatch")
+        runner.session_service.create_session.assert_awaited_once_with(
+            app_name="prpatch",
+            user_id="ci",
+        )
+        self.assertEqual(runner.run_args["session_id"], "session-id")
+        self.assertEqual(runner.run_args["new_message"].parts[0].text, "fix the failure")
+
+    async def test_run_agent_supports_sync_session_creation(self):
+        session = SimpleNamespace(id="session-id")
+        runner = RunnerStub(session)
+
+        with patch("google.adk.runners.InMemoryRunner", return_value=runner):
+            events = await main.run_agent(MagicMock(), "fix the failure", user_id="worker")
+
+        self.assertEqual(events, ["event-1", "event-2"])
+        runner.session_service.create_session.assert_called_once_with(
+            app_name="prpatch",
+            user_id="worker",
+        )
+        self.assertEqual(runner.run_args["user_id"], "worker")
+
+    async def test_run_agent_executes_real_runner_with_fake_model(self):
+        agent = Agent(name="runner_compatibility_test", model=StaticLlm())
+
+        events = await main.run_agent(agent, "Say the test response.")
+
+        self.assertIn(
+            "Runner completed without external API calls.",
+            main._event_text(events),
+        )
