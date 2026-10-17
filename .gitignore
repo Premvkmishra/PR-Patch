@@ -1,0 +1,19 @@
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Environment Secrets
+.env
+*.env
+
+# Python caching
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Log files
+*.log
+webhook_server.log
+failed_job_*.log
