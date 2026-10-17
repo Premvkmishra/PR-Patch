@@ -1,9 +1,10 @@
-import os
-import httpx
 import base64
 import logging
+import os
 from typing import AsyncGenerator
 from urllib.parse import quote
+
+import httpx
 from dotenv import load_dotenv
 from google.adk.agents import Agent
 from google.adk.models.base_llm import BaseLlm
@@ -13,6 +14,30 @@ from google.adk.models.llm_response import LlmResponse
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+
+def _headers() -> dict[str, str]:
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise RuntimeError("GITHUB_TOKEN is not configured")
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _tool_result(name: str, arguments: str, success: bool, detail: str = "") -> None:
+    result = "OK" if success else f"FAIL {detail}"
+    logger.info("[TOOL] %s %s result=%s", name, arguments, result)
+
+
+def _redact_secrets(text: str) -> str:
+    for variable in ("GITHUB_TOKEN", "WEBHOOK_SECRET", "GROQ_API_KEY", "GOOGLE_API_KEY"):
+        secret = os.getenv(variable)
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return text
 
 
 class GeminiWithGroqFallback(BaseLlm):
@@ -53,7 +78,7 @@ class GeminiWithGroqFallback(BaseLlm):
             ) from failure
 
         logger.warning(
-            "Gemini failed before returning a response; trying the Groq fallback: %s",
+            "[MODEL] Gemini failed before responding; trying Groq fallback: %s",
             failure,
         )
         from google.adk.models.lite_llm import LiteLlm
@@ -64,233 +89,369 @@ class GeminiWithGroqFallback(BaseLlm):
         ):
             yield response
 
-# Tool 1: fetch_run_jobs
+
 def fetch_run_jobs(repo: str, run_id: str) -> str:
-    """
-    Fetches failed job logs for a specific GitHub Actions workflow run.
-    """
-    print(f"AGENT ACTION: Fetching jobs for run {run_id} to read logs...")
-    load_dotenv()
-    token = os.getenv("GITHUB_TOKEN")
-    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-    if token: headers["Authorization"] = f"Bearer {token}"
+    logger.info("[TOOL] fetch_run_jobs repo=%s run=%s start", repo, run_id)
+    try:
+        headers = _headers()
+    except RuntimeError as error:
+        _tool_result("fetch_run_jobs", f"repo={repo} run={run_id}", False, str(error))
+        return f"Error fetching jobs: {error}"
 
     url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
-    with httpx.Client(follow_redirects=True) as client:
+    with httpx.Client(follow_redirects=True, timeout=30) as client:
         response = client.get(url, headers=headers)
         if response.status_code != 200:
+            _tool_result(
+                "fetch_run_jobs",
+                f"repo={repo} run={run_id}",
+                False,
+                f"HTTP {response.status_code}",
+            )
             return f"Error fetching jobs: HTTP {response.status_code} - {response.text}"
 
         jobs = response.json().get("jobs", [])
         failed_jobs = [
-            job for job in jobs
-            if job.get("conclusion") in ("failure", "cancelled")
+            job for job in jobs if job.get("conclusion") == "failure"
         ]
         if not failed_jobs:
-            return f"No failed jobs found for run {run_id}. Job details: {response.text}"
+            _tool_result(
+                "fetch_run_jobs", f"repo={repo} run={run_id}", False, "no failed jobs"
+            )
+            return f"No failed jobs found for run {run_id}."
 
         job_logs = []
         for job in failed_jobs:
             job_id = job.get("id")
+            job_name = job.get("name", str(job_id))
             if not job_id:
+                _tool_result(
+                    "fetch_job_logs",
+                    f"repo={repo} job={job_name!r}",
+                    False,
+                    "missing job id",
+                )
                 continue
-            logs_url = f"https://api.github.com/repos/{repo}/actions/jobs/{job_id}/logs"
-            logs_response = client.get(logs_url, headers=headers)
+            logs_response = client.get(
+                f"https://api.github.com/repos/{repo}/actions/jobs/{job_id}/logs",
+                headers=headers,
+            )
             if logs_response.status_code == 200:
+                logger.info(
+                    "[TOOL] fetch_job_logs repo=%s job=%r result=OK",
+                    repo,
+                    job_name,
+                )
                 job_logs.append(
-                    f"=== Logs for job: {job.get('name', job_id)} ===\n"
-                    f"{logs_response.text}"
+                    f"=== Logs for job: {job_name} ===\n{logs_response.text}"
                 )
             else:
-                job_logs.append(
-                    f"Could not fetch logs for job {job.get('name', job_id)}: "
-                    f"HTTP {logs_response.status_code} - {logs_response.text}"
+                _tool_result(
+                    "fetch_job_logs",
+                    f"repo={repo} job={job_name!r}",
+                    False,
+                    f"HTTP {logs_response.status_code}",
                 )
-        return "\n\n".join(job_logs) or f"No logs available for run {run_id}."
 
-# Tool 2: get_file_contents
-def get_file_contents(repo: str, path: str, ref: str = "main") -> str:
-    """
-    Fetches the actual source code of a file from the repository.
-    Returns the decoded file content as a string.
-    """
-    print(f"AGENT ACTION: Fetching source code for {path}...")
-    load_dotenv()
-    token = os.getenv("GITHUB_TOKEN")
-    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-    if token: headers["Authorization"] = f"Bearer {token}"
+        result = _redact_secrets("\n\n".join(job_logs))
+        _tool_result(
+            "fetch_run_jobs",
+            f"repo={repo} run={run_id}",
+            bool(result),
+            "" if result else "failure logs unavailable",
+        )
+        return result or f"No logs available for run {run_id}."
+
+
+def get_file_contents(repo: str, path: str, ref: str = "") -> str:
+    logger.info(
+        "[TOOL] get_file_contents repo=%s path=%s ref=%s start",
+        repo,
+        path,
+        ref or "default",
+    )
+    try:
+        headers = _headers()
+    except RuntimeError as error:
+        _tool_result("get_file_contents", f"path={path} ref={ref}", False, str(error))
+        return f"Error fetching file: {error}"
 
     url = f"https://api.github.com/repos/{repo}/contents/{quote(path, safe='/')}"
-    with httpx.Client() as client:
-        response = client.get(url, headers=headers, params={"ref": ref})
-        if response.status_code == 200:
-            data = response.json()
-            if "content" in data:
-                return base64.b64decode(data["content"]).decode('utf-8')
-            return "No content field returned."
-        return f"Error fetching file: HTTP {response.status_code}"
+    params = {"ref": ref} if ref else None
+    with httpx.Client(timeout=30) as client:
+        response = client.get(url, headers=headers, params=params)
+        if response.status_code != 200:
+            _tool_result(
+                "get_file_contents",
+                f"path={path} ref={ref or 'default'}",
+                False,
+                f"HTTP {response.status_code}",
+            )
+            return f"Error fetching file: HTTP {response.status_code}"
+        data = response.json()
+        if "content" not in data:
+            _tool_result(
+                "get_file_contents",
+                f"path={path} ref={ref or 'default'}",
+                False,
+                "content missing",
+            )
+            return "Error fetching file: GitHub response did not include content."
+        content = base64.b64decode(data["content"]).decode("utf-8")
+        _tool_result(
+            "get_file_contents",
+            f"path={path} ref={ref or 'default'}",
+            True,
+        )
+        return content
 
-# Tool 3: create_branch
-def create_branch(repo: str, base_sha: str, new_branch_name: str) -> str:
-    """
-    Creates a new git branch pointing to the base_sha.
-    Returns a success or failure message.
-    """
-    print(f"AGENT ACTION: Creating new branch {new_branch_name}...")
-    load_dotenv()
-    token = os.getenv("GITHUB_TOKEN")
-    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-    if token: headers["Authorization"] = f"Bearer {token}"
+
+def create_branch(
+    repo: str, base_sha: str, new_branch_name: str, run_id: str = ""
+) -> str:
+    logger.info(
+        "[TOOL] create_branch repo=%s branch=%s base=%s start",
+        repo,
+        new_branch_name,
+        base_sha[:7],
+    )
+    if (
+        not new_branch_name.startswith("prpatch/")
+        or len(base_sha) < 7
+        or base_sha[:7] not in new_branch_name
+        or (run_id and run_id not in new_branch_name)
+    ):
+        _tool_result(
+            "create_branch",
+            f"branch={new_branch_name}",
+            False,
+            "must start prpatch/, include base SHA prefix, and include run ID",
+        )
+        return (
+            "Error creating branch: name must start with prpatch/, include "
+            "the first 7 characters of base_sha, and include run_id."
+        )
+    try:
+        headers = _headers()
+    except RuntimeError as error:
+        _tool_result("create_branch", f"branch={new_branch_name}", False, str(error))
+        return f"Error creating branch: {error}"
 
     url = f"https://api.github.com/repos/{repo}/git/refs"
     payload = {"ref": f"refs/heads/{new_branch_name}", "sha": base_sha}
-
-    with httpx.Client() as client:
+    with httpx.Client(timeout=30) as client:
         response = client.post(url, headers=headers, json=payload)
-        if response.status_code == 201 or (response.status_code == 422 and "Reference already exists" in response.text):
+        if response.status_code == 201:
+            logger.info(
+                "[TOOL] Branch created: %s  (base: %s)",
+                new_branch_name,
+                base_sha[:7],
+            )
+            _tool_result("create_branch", f"branch={new_branch_name}", True)
             return f"Successfully created branch {new_branch_name}"
+        _tool_result(
+            "create_branch",
+            f"branch={new_branch_name}",
+            False,
+            f"HTTP {response.status_code}",
+        )
         return f"Error creating branch: HTTP {response.status_code} - {response.text}"
 
-# Tool 4: update_file
+
 def update_file(repo: str, path: str, content: str, branch: str, sha: str) -> str:
-    """
-    Commits the fixed code (content) to the specified file path on the specified branch.
-    You must provide the blob sha of the file being replaced.
-    Returns a success or failure message.
-    """
-    print(f"AGENT ACTION: Committing fixed code for {path} to branch {branch}...")
-    load_dotenv()
-    token = os.getenv("GITHUB_TOKEN")
-    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-    if token: headers["Authorization"] = f"Bearer {token}"
-
-    url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    encoded_content = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-    payload = {
-        "message": "AI Auto-Fix: Resolved CI/CD Pipeline Failure",
-        "content": encoded_content,
-        "sha": sha,
-        "branch": branch
-    }
-    with httpx.Client() as client:
-        response = client.put(url, headers=headers, json=payload)
-        if response.status_code in [200, 201]:
-            return "Successfully committed fix!"
-        return f"Error committing file: HTTP {response.status_code} - {response.text}"
-
-# Tool 5: get_file_sha
-def get_file_sha(repo: str, path: str, ref: str = "main") -> str:
-    """
-    Gets the blob SHA for a specific file in the repository. This is required before calling update_file.
-    """
-    print(f"AGENT ACTION: Fetching blob SHA for {path}...")
-    load_dotenv()
-    token = os.getenv("GITHUB_TOKEN")
-    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-    if token: headers["Authorization"] = f"Bearer {token}"
+    logger.info(
+        "[TOOL] update_file repo=%s path=%s branch=%s start",
+        repo,
+        path,
+        branch,
+    )
+    try:
+        headers = _headers()
+    except RuntimeError as error:
+        _tool_result("update_file", f"path={path} branch={branch}", False, str(error))
+        return f"Error committing file: {error}"
 
     url = f"https://api.github.com/repos/{repo}/contents/{quote(path, safe='/')}"
-    with httpx.Client() as client:
-        response = client.get(url, headers=headers, params={"ref": ref})
-        if response.status_code == 200:
-            return response.json().get("sha", "")
-        return ""
+    payload = {
+        "message": "AI Auto-Fix: Resolved CI/CD Pipeline Failure",
+        "content": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
+        "sha": sha,
+        "branch": branch,
+    }
+    with httpx.Client(timeout=30) as client:
+        response = client.put(url, headers=headers, json=payload)
+        if response.status_code in (200, 201):
+            _tool_result("update_file", f"path={path} branch={branch}", True)
+            return "Successfully committed fix!"
+        _tool_result(
+            "update_file",
+            f"path={path} branch={branch}",
+            False,
+            f"HTTP {response.status_code}",
+        )
+        return f"Error committing file: HTTP {response.status_code} - {response.text}"
 
-# Tool 6: create_pull_request
+
+def get_file_sha(repo: str, path: str, ref: str = "") -> str:
+    logger.info(
+        "[TOOL] get_file_sha repo=%s path=%s ref=%s start",
+        repo,
+        path,
+        ref or "default",
+    )
+    try:
+        headers = _headers()
+    except RuntimeError as error:
+        _tool_result("get_file_sha", f"path={path} ref={ref}", False, str(error))
+        return f"Error fetching file SHA: {error}"
+
+    url = f"https://api.github.com/repos/{repo}/contents/{quote(path, safe='/')}"
+    params = {"ref": ref} if ref else None
+    with httpx.Client(timeout=30) as client:
+        response = client.get(url, headers=headers, params=params)
+        if response.status_code != 200:
+            _tool_result(
+                "get_file_sha",
+                f"path={path} ref={ref or 'default'}",
+                False,
+                f"HTTP {response.status_code}",
+            )
+            return f"Error fetching file SHA: HTTP {response.status_code}"
+        sha = response.json().get("sha")
+        if not sha:
+            _tool_result(
+                "get_file_sha",
+                f"path={path} ref={ref or 'default'}",
+                False,
+                "sha missing",
+            )
+            return "Error fetching file SHA: GitHub response did not include a SHA."
+        _tool_result(
+            "get_file_sha",
+            f"path={path} ref={ref or 'default'}",
+            True,
+        )
+        return sha
+
+
 def create_pull_request(repo: str, branch: str, base: str, title: str, body: str) -> str:
-    """
-    Creates a new Pull Request on GitHub from the specified branch to the base branch.
-    Returns the URL of the created PR or failure message.
-    """
-    print(f"AGENT ACTION: Creating Pull Request from {branch} to {base}...")
-    load_dotenv()
-    token = os.getenv("GITHUB_TOKEN")
-    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-    if token: headers["Authorization"] = f"Bearer {token}"
+    logger.info(
+        "[TOOL] create_pull_request repo=%s head=%s base=%s start",
+        repo,
+        branch,
+        base,
+    )
+    try:
+        headers = _headers()
+    except RuntimeError as error:
+        _tool_result(
+            "create_pull_request",
+            f"head={branch} base={base}",
+            False,
+            str(error),
+        )
+        return f"Error creating Pull Request: {error}"
 
     url = f"https://api.github.com/repos/{repo}/pulls"
-    payload = {
-        "title": title,
-        "head": branch,
-        "base": base,
-        "body": body
-    }
-    with httpx.Client() as client:
+    payload = {"title": title, "head": branch, "base": base, "body": body}
+    with httpx.Client(timeout=30) as client:
         response = client.post(url, headers=headers, json=payload)
         if response.status_code == 201:
             pr_url = response.json().get("html_url")
+            if pr_url:
+                logger.info(
+                    "[TOOL] Pull Request opened: %s  (%s -> %s)",
+                    pr_url,
+                    branch,
+                    base,
+                )
+            _tool_result("create_pull_request", f"head={branch} base={base}", bool(pr_url), str(pr_url or "URL missing"))
             return f"Successfully created Pull Request: {pr_url}"
-        return f"Error creating Pull Request: HTTP {response.status_code} - {response.text}"
+        _tool_result(
+            "create_pull_request",
+            f"head={branch} base={base}",
+            False,
+            f"HTTP {response.status_code}",
+        )
+        return (
+            f"Error creating Pull Request: HTTP {response.status_code} - "
+            f"{response.text}"
+        )
 
-# Tool 7: list_repository_files
+
 def list_repository_files(repo: str, branch: str = "main") -> str:
-    """
-    Fetches the recursive list of all file paths in the repository for the specified branch.
-    Returns a string containing the list of all file paths.
-    """
-    print(f"AGENT ACTION: Listing all files in repository branch {branch}...")
-    load_dotenv()
-    token = os.getenv("GITHUB_TOKEN")
-    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-    if token: headers["Authorization"] = f"Bearer {token}"
+    logger.info("[TOOL] list_repository_files repo=%s ref=%s start", repo, branch)
+    try:
+        headers = _headers()
+    except RuntimeError as error:
+        _tool_result("list_repository_files", f"ref={branch}", False, str(error))
+        return f"Error listing repository files: {error}"
 
-    url = f"https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1"
-    with httpx.Client() as client:
+    ref = quote(branch, safe="")
+    url = f"https://api.github.com/repos/{repo}/git/trees/{ref}?recursive=1"
+    with httpx.Client(timeout=30) as client:
         response = client.get(url, headers=headers)
-        if response.status_code == 200:
-            tree = response.json().get("tree", [])
-            file_paths = [item.get("path") for item in tree if item.get("type") == "blob"]
-            return "\n".join(file_paths)
-        return f"Error listing repository files: HTTP {response.status_code} - {response.text}"
+        if response.status_code != 200:
+            _tool_result(
+                "list_repository_files",
+                f"ref={branch}",
+                False,
+                f"HTTP {response.status_code}",
+            )
+            return (
+                f"Error listing repository files: HTTP {response.status_code} - "
+                f"{response.text}"
+            )
+        tree = response.json().get("tree", [])
+        file_paths = [
+            item.get("path") for item in tree if item.get("type") == "blob"
+        ]
+        _tool_result(
+            "list_repository_files",
+            f"ref={branch}",
+            True,
+            f"{len(file_paths)} files",
+        )
+        return "\n".join(file_paths)
 
 
-# Initialize the ADK Agent
 cicd_agent = Agent(
     name="cicd_self_healing_agent",
     model=GeminiWithGroqFallback(),
     instruction="""
-    You are an autonomous CI/CD self-healing agent.
-    When a pipeline fails, you are given the repository name and run ID (and optionally the base_sha).
-    You must automatically execute the following workflow:
-    1. Call list_repository_files(repo, base_sha) to fetch the file structure at the failing commit.
-    2. Call fetch_run_jobs(repo, run_id) to read the failure logs.
-    3. Analyze the logs to identify the failing test/file and cross-reference it with the repository structure to get the exact file path.
-    4. Call get_file_contents(repo, failing_file_path, base_sha) to get the broken source code at the failing commit.
-    5. If the broken code imports or depends on other files (e.g. utility functions, helper components, or configurations) that are relevant to understanding/fixing the bug, call get_file_contents(repo, dependency_path, base_sha) for those files as well.
-    6. Generate a logical fix for the source code.
-    7. Generate a new, descriptive branch name prefixed with "prpatch/".
-    8. Call create_branch(repo, base_sha, branch_name) to create a new branch.
-    9. Call get_file_sha(repo, failing_file_path, base_sha) to get the file's blob SHA at the failing commit.
-    10. Call update_file(repo, failing_file_path, fixed_content, branch_name, file_sha) to commit the fix.
-    11. Call create_pull_request(repo, branch_name, target_branch, "AI Auto-Fix: Resolved CI/CD Pipeline Failure", pr_body) to create a Pull Request against the requested target_branch. For failed pull-request checks, target_branch is the PR's source branch so the focused repair can be merged into that PR.
+You are a CI/CD self-healing agent. The user prompt gives repo, run_id,
+FAILING_BRANCH, FAILING_SHA, and relevant failure logs.
 
-    Work step by step and confirm when the Pull Request is successfully created.
-    """,
-    tools=[fetch_run_jobs, get_file_contents, create_branch, update_file, get_file_sha, create_pull_request, list_repository_files]
+Follow these steps:
+1. Call list_repository_files(repo, FAILING_SHA) to list files at the exact
+   failing commit.
+2. Call fetch_run_jobs(repo, run_id), then identify the failed check, root
+   cause, and the source file that caused it. Fix source code, not tests,
+   unless a test is clearly wrong.
+3. Read the broken source and any needed dependencies with
+   get_file_contents(repo, path, FAILING_SHA).
+4. Make a minimal fix. Describe the failing check, root cause, change, and
+   modified file in the pull-request body, and state it was generated by Prpatch.
+5. Create a unique branch named
+   prpatch/fix-<short-description>-<first-7-of-FAILING_SHA>-<run_id>.
+   It must begin with prpatch/ and include both the SHA prefix and run ID.
+6. Call create_branch(repo, FAILING_SHA, branch_name, run_id).
+7. Call get_file_sha(repo, fixed_file, FAILING_SHA), then
+   update_file(repo, fixed_file, fixed_content, branch_name, file_sha).
+8. Call create_pull_request(repo, branch_name, FAILING_BRANCH,
+   "Prpatch: <short description>", body). The base must be FAILING_BRANCH,
+   never hardcode main.
+
+Stop and explain clearly if any tool reports an error. Do not claim a pull
+request was created unless create_pull_request returns its URL.
+""",
+    tools=[
+        fetch_run_jobs,
+        get_file_contents,
+        create_branch,
+        update_file,
+        get_file_sha,
+        create_pull_request,
+        list_repository_files,
+    ],
 )
-
-if __name__ == "__main__":
-    test_repo = "senthilkumaranT/frontend_for_self_healing_cicd"
-    test_run_id = "27607186455"
-    test_head_sha = "080dea81006e23606076ccf4a6f3f0293c41b87e"
-
-    # Run the agent!
-    prompt = f"The pipeline failed for repo {test_repo} on run {test_run_id}. The base commit SHA for branching is {test_head_sha}. Please fix the bug."
-    print("Starting Autonomous Workflow...")
-
-    import asyncio
-    from google.adk.runners import InMemoryRunner
-
-    async def run_test():
-        runner = InMemoryRunner(agent=cicd_agent)
-        try:
-            res = await runner.run_debug(prompt)
-            print("Workflow Complete!")
-            for event in res:
-                print(event)
-        except Exception as e:
-            print("Error executing agent:", e)
-            import traceback
-            traceback.print_exc()
-
-    asyncio.run(run_test())

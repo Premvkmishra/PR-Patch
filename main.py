@@ -1,180 +1,298 @@
-import os
 import asyncio
+import hmac
 import logging
+import os
+import re
 from typing import Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
-from pydantic import BaseModel
+
 import httpx
 from dotenv import load_dotenv
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from pydantic import BaseModel
 
 from agent import cicd_agent
 
-# Load environment variables from .env file
 load_dotenv()
 
-# Render captures standard output, so keep runtime logs on the console.
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s %(message)s",
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger("webhook_handler")
 
 app = FastAPI(title="Self-Healing CI/CD Webhook Receiver")
 
+
 class WebhookPayload(BaseModel):
-    repo: str        # e.g., "owner/repo"
-    run_id: str      # e.g., "123456789"
+    repo: str
+    run_id: str
     branch: Optional[str] = None
     head_sha: Optional[str] = None
     target_branch: Optional[str] = None
     logs: Optional[str] = None
 
+
+def _last_lines(log_text: str, limit: int = 100) -> str:
+    for variable in (
+        "GITHUB_TOKEN",
+        "WEBHOOK_SECRET",
+        "GROQ_API_KEY",
+        "GOOGLE_API_KEY",
+    ):
+        secret = os.getenv(variable)
+        if secret:
+            log_text = log_text.replace(secret, "[REDACTED]")
+    lines = log_text.splitlines()
+    return "\n".join(lines[-limit:])
+
+
+def _failed_test_count(log_text: str) -> Optional[int]:
+    matches = re.findall(r"(?m)^=+\s+(\d+)\s+failed\b", log_text)
+    return int(matches[-1]) if matches else None
+
+
+def _event_text(events) -> str:
+    event_list = events if isinstance(events, (list, tuple)) else [events]
+    text_parts = []
+    for event in event_list:
+        content = getattr(event, "content", None)
+        for part in getattr(content, "parts", []) or []:
+            text = getattr(part, "text", None)
+            if text:
+                text_parts.append(text)
+    return "\n".join(text_parts)
+
+
 async def fetch_and_log_github_failure(
     repository: str,
     run_id: str,
-    head_sha: str = None,
-    provided_logs: str = None,
-    target_branch: str = "main",
+    head_sha: Optional[str] = None,
+    provided_logs: Optional[str] = None,
+    target_branch: Optional[str] = None,
 ):
+    failing_branch = target_branch or "main"
     try:
-        if provided_logs:
-            logger.info("Using logs provided in webhook payload.")
-            logger.info("=== START OF LOGS FOR JOB: test-frontend ===")
-            print(provided_logs)
-            logger.info("=== END OF LOGS FOR JOB: test-frontend ===")
-        else:
-            # Wait for the GitHub Action to finish executing and finalize logs
-            logger.info(f"Waiting 15 seconds for GitHub Action run {run_id} to fully complete...")
-            await asyncio.sleep(15)
-
-            headers = {
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28"
-            }
-
-            # Use environment token
-            github_token = os.getenv("GITHUB_TOKEN")
-            if github_token:
-                headers["Authorization"] = f"Bearer {github_token}"
-                logger.info("Using authorization token for GitHub API request.")
-            else:
-                logger.warning("No GitHub token provided. API requests might be rate-limited or fail for private repositories.")
-
-            jobs_url = f"https://api.github.com/repos/{repository}/actions/runs/{run_id}/jobs"
-
-            with httpx.Client(follow_redirects=True) as client:
-                logger.info(f"Fetching jobs from URL: {jobs_url}")
-                response = client.get(jobs_url, headers=headers)
-
-                if response.status_code != 200:
-                    logger.error(f"Failed to fetch jobs: HTTP {response.status_code} - {response.text}")
-                    return
-
-                jobs_data = response.json()
-                jobs = jobs_data.get("jobs", [])
-                logger.info(f"Found {len(jobs)} jobs in workflow run {run_id}")
-
-                failed_jobs = [j for j in jobs if j.get("conclusion") == "failure" or j.get("status") == "completed" and j.get("conclusion") in ["failure", "cancelled"]]
-
-                # Fallback to all jobs if no failed jobs are found, so triggering always prints logs
-                jobs_to_log = failed_jobs if failed_jobs else jobs
-
-                if not jobs_to_log:
-                    logger.info("No jobs found in the workflow run.")
-                    return
-
-                for job in jobs_to_log:
-                    job_id = job.get("id")
-                    job_name = job.get("name")
-                    logger.info(f"Processing failed job: {job_name} (ID: {job_id})")
-
-                    logs_url = f"https://api.github.com/repos/{repository}/actions/jobs/{job_id}/logs"
-                    logger.info(f"Fetching logs from: {logs_url}")
-
-                    log_text = None
-                    for attempt in range(1, 6):
-                        logs_response = client.get(logs_url, headers=headers)
-                        if logs_response.status_code == 200:
-                            log_text = logs_response.text
-                            break
-                        else:
-                            logger.warning(f"Failed to fetch logs for job {job_id} on attempt {attempt}/5: HTTP {logs_response.status_code}. Retrying in 5 seconds...")
-                            await asyncio.sleep(5)
-
-                    if log_text is None:
-                        logger.error(f"Failed to fetch logs for job {job_id} after 5 attempts.")
-                        continue
-
-                    # Print the response logs directly to Vercel logs
-                    logger.info(f"=== START OF LOGS FOR JOB: {job_name} ===")
-                    print(log_text)
-                    logger.info(f"=== END OF LOGS FOR JOB: {job_name} ===")
-
-        if head_sha:
-            logger.info("Triggering Google ADK Autonomous Agent for self-healing...")
-            prompt = (
-                f"The pipeline failed for repo {repository} on run {run_id}. "
-                f"The failing commit SHA is {head_sha}. Use this exact SHA as the "
-                f"ref when reading files and as the base for the repair branch. "
-                f"Create the repair pull request against branch {target_branch}. "
-                "Please automatically execute your self-healing workflow to fix the bug."
+        if not head_sha:
+            logger.error(
+                "[SUMMARY] FAILURE repo=%s run=%s reason=missing head_sha",
+                repository,
+                run_id,
             )
-            try:
-                from google.adk.runners import InMemoryRunner
-                runner = InMemoryRunner(agent=cicd_agent)
-                response_events = await runner.run_debug(prompt)
-                logger.info(f"Agent Execution Complete. Result: {response_events}")
-            except Exception as e:
-                logger.exception(f"Error executing agent: {e}")
-        else:
-            logger.warning("No head_sha provided in webhook payload. Cannot trigger self-healing agent.")
+            return
 
-    except Exception as e:
-        logger.exception(f"Error occurred during fetching GitHub Action response: {e}")
+        token = os.getenv("GITHUB_TOKEN")
+        if not token:
+            logger.error(
+                "[SUMMARY] FAILURE repo=%s run=%s reason=GITHUB_TOKEN is not configured",
+                repository,
+                run_id,
+            )
+            return
+
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Authorization": f"Bearer {token}",
+        }
+        logger.info(
+            "[3/7] 📥 Fetching failure logs  repo=%s run=%s",
+            repository,
+            run_id,
+        )
+        combined_logs = provided_logs or ""
+
+        with httpx.Client(follow_redirects=True, timeout=30) as client:
+            jobs_url = (
+                f"https://api.github.com/repos/{repository}"
+                f"/actions/runs/{run_id}/jobs"
+            )
+            jobs_response = client.get(jobs_url, headers=headers)
+            if jobs_response.status_code != 200:
+                logger.error(
+                    "[SUMMARY] FAILURE repo=%s run=%s reason=GitHub jobs API HTTP %s",
+                    repository,
+                    run_id,
+                    jobs_response.status_code,
+                )
+                return
+
+            failed_jobs = [
+                job
+                for job in jobs_response.json().get("jobs", [])
+                if job.get("conclusion") == "failure"
+            ]
+            if not failed_jobs:
+                logger.error(
+                    "[SUMMARY] FAILURE repo=%s run=%s reason=no failed jobs found",
+                    repository,
+                    run_id,
+                )
+                return
+
+            for job in failed_jobs:
+                job_id = job.get("id")
+                job_name = job.get("name", str(job_id))
+                if not job_id:
+                    logger.error(
+                        "[TOOL] fetch_job_logs job=%r result=FAILURE reason=missing id",
+                        job_name,
+                    )
+                    continue
+
+                log_response = None
+                for attempt in range(3):
+                    log_response = client.get(
+                        f"https://api.github.com/repos/{repository}"
+                        f"/actions/jobs/{job_id}/logs",
+                        headers=headers,
+                    )
+                    if log_response.status_code == 200:
+                        break
+                    if attempt < 2:
+                        await asyncio.sleep(2)
+
+                if log_response is None or log_response.status_code != 200:
+                    status_code = log_response.status_code if log_response else "no response"
+                    logger.error(
+                        "[TOOL] fetch_job_logs job=%r result=FAILURE http_status=%s",
+                        job_name,
+                        status_code,
+                    )
+                    continue
+
+                job_log = log_response.text
+                combined_logs += f"\n=== Failed job: {job_name} ===\n{job_log}"
+                test_count = _failed_test_count(job_log)
+                count_note = f"  ({test_count} tests failed)" if test_count is not None else ""
+                logger.info(
+                    "[3/7] 📥 Fetched failure logs for job %r%s",
+                    job_name,
+                    count_note,
+                )
+                logger.info("[LOGS] job=%r last_lines=100\n%s", job_name, _last_lines(job_log))
+
+        if not combined_logs:
+            logger.error(
+                "[SUMMARY] FAILURE repo=%s run=%s reason=no failure logs available",
+                repository,
+                run_id,
+            )
+            return
+
+        if provided_logs:
+            logger.info("[3/7] 📥 Using failure logs supplied in webhook payload")
+            logger.info("[LOGS] last_lines=100\n%s", _last_lines(provided_logs))
+
+        logger.info("[4/7] 🤖 Agent started  model=gemini-2.5-flash")
+        prompt = (
+            f"repo={repository}\nrun_id={run_id}\n"
+            f"FAILING_BRANCH={failing_branch}\nFAILING_SHA={head_sha}\n"
+            f"The failing branch is {failing_branch}. Read files from this "
+            f"branch at failing commit {head_sha}, and open the fix Pull "
+            f"Request into {failing_branch}. Include the failing check, "
+            "root cause, change made, modified files, and that the fix was "
+            f"generated by Prpatch.\nFailure logs:\n{_last_lines(combined_logs)}"
+        )
+
+        from google.adk.runners import InMemoryRunner
+
+        runner = InMemoryRunner(agent=cicd_agent)
+        events = await runner.run_debug(prompt)
+        response_text = _event_text(events)
+        all_event_text = "\n".join((response_text, str(events)))
+        if response_text:
+            logger.info("[5/7] 🔎 Agent summary: %s", response_text[-500:].replace("\n", " "))
+        branch_matches = re.findall(r"prpatch/[A-Za-z0-9._/-]+", all_event_text)
+        pull_requests = re.findall(
+            r"https://github\.com/[^\s\"'<>]+/pull/\d+",
+            all_event_text,
+        )
+        if pull_requests:
+            pr_url = pull_requests[-1].rstrip(".,)")
+            if branch_matches:
+                logger.info(
+                    "[6/7] 🌿 Repair branch: %s  (base: %s)",
+                    branch_matches[-1].rstrip(".,)"),
+                    failing_branch,
+                )
+            logger.info(
+                "[7/7] ✅ Pull Request opened: %s  (prpatch/... -> %s)",
+                pr_url,
+                failing_branch,
+            )
+            logger.info(
+                "[SUMMARY] SUCCESS repo=%s run=%s pr=%s",
+                repository,
+                run_id,
+                pr_url,
+            )
+        else:
+            logger.error(
+                "[SUMMARY] FAILURE repo=%s run=%s reason=agent completed without a Pull Request; inspect tool results",
+                repository,
+                run_id,
+            )
+    except Exception as error:
+        logger.exception(
+            "[SUMMARY] FAILURE repo=%s run=%s reason=%s",
+            repository,
+            run_id,
+            error,
+        )
+
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
+
 @app.post("/webhook")
 async def receive_webhook(
-    request: Request, payload: WebhookPayload, background_tasks: BackgroundTasks
+    request: Request,
+    payload: WebhookPayload,
+    background_tasks: BackgroundTasks,
 ):
-    target_branch = payload.target_branch or payload.branch or "main"
+    failing_branch = payload.target_branch or "main"
     logger.info(
-        "🚀 WEBHOOK TRIGGERED! Pipeline failed for repository: %s, Run ID: %s, "
-        "Branch: %s, repair PR target: %s",
+        "[1/7] 🔔 Webhook received  repo=%s run=%s branch=%s",
         payload.repo,
         payload.run_id,
-        payload.branch,
-        target_branch,
+        failing_branch,
     )
 
-    auth = request.headers.get("Authorization")
-
     if not WEBHOOK_SECRET:
-        logger.error("CRITICAL: WEBHOOK_SECRET is not set in the environment variables on this server!")
+        logger.error(
+            "[SUMMARY] FAILURE repo=%s run=%s reason=WEBHOOK_SECRET is not configured",
+            payload.repo,
+            payload.run_id,
+        )
         raise HTTPException(
-            status_code=503, detail="Webhook authentication is not configured"
+            status_code=503,
+            detail="Webhook authentication is not configured",
         )
 
-    if auth != f"Bearer {WEBHOOK_SECRET}":
-        logger.warning(f"Unauthorized webhook attempt. Authentication failed.")
+    auth = request.headers.get("Authorization")
+    if not auth or not hmac.compare_digest(auth, f"Bearer {WEBHOOK_SECRET}"):
+        logger.warning(
+            "[SUMMARY] FAILURE repo=%s run=%s reason=unauthorized webhook",
+            payload.repo,
+            payload.run_id,
+        )
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    logger.info("✅ Webhook authentication successful. Scheduling failure processing.")
+    logger.info("[2/7] 🔐 Auth OK")
     background_tasks.add_task(
         fetch_and_log_github_failure,
         payload.repo,
         payload.run_id,
         payload.head_sha,
         payload.logs,
-        target_branch,
+        failing_branch,
     )
-
     return {
         "status": "success",
-        "message": f"Webhook received. Processing run {payload.run_id} in the background."
+        "message": f"Webhook received. Processing run {payload.run_id} in the background.",
     }
+
 
 @app.get("/health")
 def health_check():

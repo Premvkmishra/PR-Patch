@@ -1,18 +1,14 @@
+import base64
 import os
 import unittest
-import base64
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 
-from agent import (
-    GeminiWithGroqFallback,
-    fetch_run_jobs,
-    get_file_contents,
-    get_file_sha,
-)
+from agent import GeminiWithGroqFallback, create_branch, fetch_run_jobs, get_file_contents, get_file_sha
 import main
 
 
@@ -63,12 +59,12 @@ class StubHttpClient:
     def __exit__(self, exc_type, exc_value, traceback):
         return False
 
-    def get(self, url, headers):
+    def get(self, url, headers, params=None):
         self.request_headers.append(headers)
         return self.responses.pop(0)
 
 
-class RecordingContentClient:
+class RecordingHttpClient:
     def __init__(self, response):
         self.response = response
         self.calls = []
@@ -80,8 +76,32 @@ class RecordingContentClient:
         return False
 
     def get(self, url, headers, params=None):
-        self.calls.append((url, params))
+        self.calls.append((url, headers, params))
         return self.response
+
+    def post(self, url, headers, json):
+        self.calls.append((url, headers, json))
+        return self.response
+
+
+class ActionLogsClient:
+    def __init__(self, log_text):
+        self.log_text = log_text
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def get(self, url, headers):
+        if url.endswith("/jobs"):
+            return StubResponse(
+                200,
+                "",
+                {"jobs": [{"id": 9, "name": "unit-tests", "conclusion": "failure"}]},
+            )
+        return StubResponse(200, self.log_text)
 
 
 class GeminiWithGroqFallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -133,7 +153,7 @@ class FetchRunJobsTests(unittest.TestCase):
         ):
             logs = fetch_run_jobs("owner/repo", "123")
 
-        mock_client.assert_called_once_with(follow_redirects=True)
+        mock_client.assert_called_once_with(follow_redirects=True, timeout=30)
         self.assertTrue(
             all(
                 headers["Authorization"] == "Bearer test-token"
@@ -144,28 +164,66 @@ class FetchRunJobsTests(unittest.TestCase):
         self.assertIn("AssertionError: expected 1, got 2", logs)
 
 
-class RepositoryRefTests(unittest.TestCase):
-    def test_get_file_contents_reads_requested_commit(self):
-        client = RecordingContentClient(
-            StubResponse(
-                200,
-                "",
-                {"content": base64.b64encode(b"source at commit").decode()},
-            )
+class GitHubRefTests(unittest.TestCase):
+    def test_get_file_contents_uses_requested_ref_and_token(self):
+        response = StubResponse(
+            200,
+            "",
+            {"content": base64.b64encode(b"source").decode()},
         )
-        with patch("agent.httpx.Client", return_value=client):
-            content = get_file_contents("owner/repo", "src/file.py", "commit-sha")
+        client = RecordingHttpClient(response)
 
-        self.assertEqual(content, "source at commit")
-        self.assertEqual(client.calls[0][1], {"ref": "commit-sha"})
+        with (
+            patch.dict(os.environ, {"GITHUB_TOKEN": "test-token"}),
+            patch("agent.httpx.Client", return_value=client),
+        ):
+            content = get_file_contents("owner/repo", "src/utils.py", "test1")
 
-    def test_get_file_sha_reads_requested_commit(self):
-        client = RecordingContentClient(StubResponse(200, "", {"sha": "blob-sha"}))
-        with patch("agent.httpx.Client", return_value=client):
-            sha = get_file_sha("owner/repo", "src/file.py", "commit-sha")
+        self.assertEqual(content, "source")
+        self.assertEqual(client.calls[0][2], {"ref": "test1"})
+        self.assertEqual(
+            client.calls[0][1]["Authorization"],
+            "Bearer test-token",
+        )
+
+    def test_get_file_sha_uses_requested_ref(self):
+        response = StubResponse(200, "", {"sha": "blob-sha"})
+        client = RecordingHttpClient(response)
+
+        with (
+            patch.dict(os.environ, {"GITHUB_TOKEN": "test-token"}),
+            patch("agent.httpx.Client", return_value=client),
+        ):
+            sha = get_file_sha("owner/repo", "src/utils.py", "failing-sha")
 
         self.assertEqual(sha, "blob-sha")
-        self.assertEqual(client.calls[0][1], {"ref": "commit-sha"})
+        self.assertEqual(client.calls[0][2], {"ref": "failing-sha"})
+
+    def test_create_branch_requires_unique_prpatch_name(self):
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "test-token"}):
+            result = create_branch(
+                "owner/repo",
+                "abcdef012345",
+                "fix/failure",
+                "123",
+            )
+
+        self.assertIn("must start with prpatch/", result)
+
+    def test_create_branch_uses_unique_prpatch_name(self):
+        client = RecordingHttpClient(StubResponse(201, "", {}))
+        branch = "prpatch/fix-average-abcdef0-123"
+        with (
+            patch.dict(os.environ, {"GITHUB_TOKEN": "test-token"}),
+            patch("agent.httpx.Client", return_value=client),
+        ):
+            result = create_branch("owner/repo", "abcdef012345", branch, "123")
+
+        self.assertIn(branch, result)
+        self.assertEqual(
+            client.calls[0][2],
+            {"ref": f"refs/heads/{branch}", "sha": "abcdef012345"},
+        )
 
 
 class WebhookAuthTests(unittest.TestCase):
@@ -180,9 +238,9 @@ class WebhookAuthTests(unittest.TestCase):
         payload = {
             "repo": "owner/repo",
             "run_id": "123",
-            "branch": "feature/source",
-            "head_sha": "commit-sha",
-            "target_branch": "feature/source",
+            "branch": "test1",
+            "head_sha": "abcdef012345",
+            "target_branch": "test1",
         }
         process_failure = AsyncMock()
 
@@ -209,26 +267,86 @@ class WebhookAuthTests(unittest.TestCase):
         process_failure.assert_awaited_once_with(
             "owner/repo",
             "123",
-            "commit-sha",
+            "abcdef012345",
             None,
-            "feature/source",
+            "test1",
+        )
+
+    def test_missing_target_branch_defaults_to_main(self):
+        client = TestClient(main.app)
+        process_failure = AsyncMock()
+
+        with (
+            patch.object(main, "WEBHOOK_SECRET", "test-secret"),
+            patch("main.fetch_and_log_github_failure", new=process_failure),
+        ):
+            response = client.post(
+                "/webhook",
+                json={"repo": "owner/repo", "run_id": "124"},
+                headers={"Authorization": "Bearer test-secret"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        process_failure.assert_awaited_once_with(
+            "owner/repo",
+            "124",
+            None,
+            None,
+            "main",
         )
 
 
-class RepairPromptTests(unittest.IsolatedAsyncioTestCase):
-    async def test_repair_prompt_uses_requested_target_branch(self):
-        runner = MagicMock()
-        runner.run_debug = AsyncMock(return_value=[])
+class FailureProcessingTests(unittest.IsolatedAsyncioTestCase):
+    def test_render_log_excerpt_truncates_and_redacts_secrets(self):
+        lines = "\n".join(f"line-{index}" for index in range(110))
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "do-not-log-token"}):
+            excerpt = main._last_lines(f"{lines}\ndo-not-log-token", limit=100)
 
-        with patch("google.adk.runners.InMemoryRunner", return_value=runner):
+        self.assertIn("line-109", excerpt)
+        self.assertNotIn("line-0\n", excerpt)
+        self.assertNotIn("do-not-log-token", excerpt)
+        self.assertIn("[REDACTED]", excerpt)
+
+    async def test_reads_failing_commit_and_reports_pr_summary(self):
+        log_text = "\n".join(f"output line-{index}" for index in range(110))
+        runner = MagicMock()
+        runner.run_debug = AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    content=SimpleNamespace(
+                        parts=[
+                            SimpleNamespace(
+                                text=(
+                                    "Root cause: src/utils.py::is_even. "
+                                    "Successfully created Pull Request: "
+                                    "https://github.com/owner/repo/pull/7"
+                                )
+                            )
+                        ]
+                    )
+                )
+            ]
+        )
+        http_client = ActionLogsClient(log_text)
+
+        with (
+            patch.dict(os.environ, {"GITHUB_TOKEN": "test-token"}),
+            patch("main.httpx.Client", return_value=http_client),
+            patch("google.adk.runners.InMemoryRunner", return_value=runner),
+            self.assertLogs("webhook_handler", level="INFO") as captured,
+        ):
             await main.fetch_and_log_github_failure(
                 "owner/repo",
                 "123",
-                "commit-sha",
-                "test log",
-                "feature/source",
+                "abcdef012345",
+                target_branch="test1",
             )
 
         prompt = runner.run_debug.await_args.args[0]
-        self.assertIn("Create the repair pull request against branch feature/source", prompt)
-        self.assertIn("Use this exact SHA as the ref", prompt)
+        self.assertIn("failing branch is test1", prompt)
+        self.assertIn("at failing commit abcdef012345", prompt)
+        output = "\n".join(captured.output)
+        self.assertIn("output line-109", output)
+        self.assertNotIn("output line-0", output)
+        self.assertIn("Root cause: src/utils.py::is_even", output)
+        self.assertIn("https://github.com/owner/repo/pull/7", output)
