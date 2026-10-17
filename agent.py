@@ -258,7 +258,7 @@ cicd_agent = Agent(
     4. Call get_file_contents(repo, failing_file_path, base_sha) to get the broken source code at the failing commit.
     5. If the broken code imports or depends on other files (e.g. utility functions, helper components, or configurations) that are relevant to understanding/fixing the bug, call get_file_contents(repo, dependency_path, base_sha) for those files as well.
     6. Generate a logical fix for the source code.
-    7. Generate a new, descriptive branch name.
+    7. Generate a new, descriptive branch name prefixed with "prpatch/".
     8. Call create_branch(repo, base_sha, branch_name) to create a new branch.
     9. Call get_file_sha(repo, failing_file_path, base_sha) to get the file's blob SHA at the failing commit.
     10. Call update_file(repo, failing_file_path, fixed_content, branch_name, file_sha) to commit the fix.
