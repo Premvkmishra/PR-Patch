@@ -1,10 +1,16 @@
-![PRpatch self-healing run logs](assets/Screenshot%202026-10-17%20175445.png)
-
 # PRpatch
 
-**An AI-powered CI repair agent that analyzes failed GitHub Actions runs and proposes focused fixes through pull requests.**
+PRpatch watches GitHub Actions and detects failed CI runs.
+It analyzes failure logs and uses an AI agent to propose a focused code fix.
+It validates the change and opens a `prpatch/` pull request for a human to review.
 
-PRpatch is an open-source MVP built with FastAPI and Google Agent Development Kit (ADK). When a supported CI workflow fails, the target repository notifies PRpatch. PRpatch retrieves the failed job logs, asks a Gemini-powered agent to identify a likely root cause and suggest a minimal single-file change, validates the proposed change, and—if it passes the guardrails—opens a pull request for a human to review.
+## Screenshots
+
+![GitHub Actions workflow runs](assets/Screenshot%202026-10-17%20180527.png)
+![CI failure and self-healing workflow](assets/Screenshot%202026-10-17%20173506.png)
+![PRpatch workflow notification](assets/Screenshot%202026-10-17%20173523.png)
+![Self-healing agent activity](assets/Screenshot%202026-10-17%20173537.png)
+![PRpatch Render logs](assets/Screenshot%202026-10-17%20175445.png)
 
 > **Status:** MVP / experimental. Automated fixes are suggestions, not guarantees. Review every generated pull request before merging.
 
